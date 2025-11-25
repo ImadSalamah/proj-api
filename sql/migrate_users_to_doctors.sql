@@ -1,0 +1,5 @@
+-- Migrate users with role='doctor' into DOCTORS table
+INSERT INTO DOCTORS (DOCTOR_ID, ALLOWED_FEATURES, DOCTOR_TYPE, CREATED_AT)
+SELECT USER_ID, '[]', NVL(TYPE, 'طبيب عام'), SYSTIMESTAMP
+FROM USERS
+WHERE LOWER(NVL(ROLE,'')) = 'doctor';
