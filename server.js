@@ -13,6 +13,7 @@ const XLSX = require("xlsx");
 const compression = require("compression");
 const oracledb = require("oracledb");
 const apicache = require("apicache");
+const { v4: uuidv4 } = require("uuid");
 require("dotenv").config();
 
 const app = express();
@@ -79,25 +80,9 @@ async function getConnection() {
   return await oracledb.getConnection();
 }
 
-// ================================
-//  Cloudinary (موجود فقط لو احتجت ترجعله)
-// ================================
-let cloudinary = null;
-const cloudinaryConfigured =
-  process.env.CLOUDINARY_CLOUD_NAME &&
-  process.env.CLOUDINARY_API_KEY &&
-  process.env.CLOUDINARY_API_SECRET;
 
-if (cloudinaryConfigured) {
-  cloudinary = require("cloudinary").v2;
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
-  });
-} else {
-  console.warn("⚠️ Cloudinary is not configured; upload-image endpoint will return 503.");
-}
+
+
 
 // ================================
 //  Global Middlewares
@@ -116,8 +101,14 @@ app.use(
 );
 
 // CORS (كما طلبت)
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
+    // ⚠️ Dev mode: allow all origins; set ALLOWED_ORIGINS for prod
     origin: "*"
   })
 );
@@ -127,7 +118,16 @@ app.use(
 // ================================
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 5 * 1024 * 1024 }
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "text/csv"
+    ];
+    if (allowed.includes(file.mimetype)) return cb(null, true);
+    cb(new Error("Invalid file type. Only Excel/CSV files are allowed."));
+  }
 });
 
 // ================================
@@ -207,52 +207,6 @@ function parseDoubleEncodedJSON(jsonString) {
   }
 }
 
-// Ensure XRAY_IMAGES table exists so x-ray uploads do not fail with ORA-00942
-async function ensureXrayImagesTable() {
-  let connection;
-  try {
-    connection = await getConnection();
-
-    const exists = await connection.execute(
-      `SELECT COUNT(*) AS CNT FROM USER_TABLES WHERE TABLE_NAME = 'XRAY_IMAGES'`,
-      [],
-      { outFormat: oracledb.OUT_FORMAT_OBJECT }
-    );
-
-    if (exists.rows?.[0]?.CNT > 0) return;
-
-    await connection.execute(
-      `CREATE TABLE XRAY_IMAGES (
-        IMAGE_ID            VARCHAR2(60) PRIMARY KEY,
-        REQUEST_ID          VARCHAR2(100),
-        PATIENT_ID          VARCHAR2(100),
-        PATIENT_NAME        VARCHAR2(200),
-        STUDENT_ID          VARCHAR2(100),
-        STUDENT_NAME        VARCHAR2(200),
-        XRAY_TYPE           VARCHAR2(100) NOT NULL,
-        IMAGE_URL           VARCHAR2(500) NOT NULL,
-        CLOUDINARY_URL      VARCHAR2(500),
-        CLOUDINARY_PUBLIC_ID VARCHAR2(200),
-        UPLOADED_AT         TIMESTAMP DEFAULT SYSTIMESTAMP,
-        UPLOADED_BY         VARCHAR2(200),
-        STATUS              VARCHAR2(50) DEFAULT 'uploaded'
-      )`
-    );
-
-    await connection.execute(
-      `CREATE INDEX IDX_XRAY_IMAGES_PATIENT ON XRAY_IMAGES (PATIENT_ID)`
-    );
-    await connection.execute(
-      `CREATE INDEX IDX_XRAY_IMAGES_REQUEST ON XRAY_IMAGES (REQUEST_ID)`
-    );
-    await connection.commit();
-    console.log("✔ XRAY_IMAGES table created automatically");
-  } catch (err) {
-    console.error("❌ Failed to ensure XRAY_IMAGES table:", err);
-  } finally {
-    if (connection) await connection.close();
-  }
-}
 
 // Pagination helper without تغيير السلوك الافتراضي
 function getPagination(req, defaultLimit = 0, maxLimit = 200) {
@@ -312,10 +266,17 @@ function extractStudyYear(value) {
 // جاهز – هون بتحط باقي الــ Routes
 // ================================
 
+// Require JWT for all routes except login (and allow CORS preflight)
+const PUBLIC_ROUTES = new Set(["/login"]);
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") return next();
+  if (PUBLIC_ROUTES.has(req.path)) return next();
+  return auth(req, res, next);
+});
 
 const uploadExcel = upload;
 
-app.post("/import-dental-students", uploadExcel.single("file"), async (req, res) => {
+app.post("/import-dental-students", auth, uploadExcel.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "❌ Please upload an Excel file." });
   }
@@ -438,13 +399,17 @@ app.post("/import-dental-students", uploadExcel.single("file"), async (req, res)
 
   } finally {
     if (connection) await connection.close();
+    try {
+      const fs = require("fs");
+      if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    } catch {}
   }
 });
 
 // ================================
 // Import Users from Excel (Complete Version)
 // ================================
-app.post("/import-users", upload.single("file"), async (req, res) => {
+app.post("/import-users", auth, upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "❌ Please upload an Excel file." });
   }
@@ -614,7 +579,6 @@ app.post("/import-users", upload.single("file"), async (req, res) => {
           user_id: USER_ID,
           username: USERNAME,
           email: EMAIL,
-          password: plainPassword,
           role: ROLE,
           status: "success"
         });
@@ -1397,7 +1361,7 @@ app.get("/patients/by-appointment-id/:idnumber", async (req, res) => {
 
 
 // 12. Get all pending users
-app.get("/pendingUsers", async (req, res) => {
+app.get("/pendingUsers", auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection(); // FIXED
@@ -1426,7 +1390,7 @@ app.get("/pendingUsers", async (req, res) => {
 
 
 // 13. Add new pending user
-app.post("/pendingUsers", async (req, res) => {
+app.post("/pendingUsers", auth, async (req, res) => {
   let connection;
 
   let parsedBody = typeof req.body === "string"
@@ -1486,7 +1450,7 @@ app.post("/pendingUsers", async (req, res) => {
 
 
 // 14. Update IQRAR
-app.put("/pendingUsers/:userId", async (req, res) => {
+app.put("/pendingUsers/:userId", auth, async (req, res) => {
   const { userId } = req.params;
   const { IQRAR } = req.body;
 
@@ -1515,7 +1479,7 @@ app.put("/pendingUsers/:userId", async (req, res) => {
 
 
 // 15. Approve user
-app.post("/approveUser", async (req, res) => {
+app.post("/approveUser", auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection(); // FIXED
@@ -1605,7 +1569,7 @@ app.post("/approveUser", async (req, res) => {
 
 
 // 16. Reject user
-app.post("/rejectUser", async (req, res) => {
+app.post("/rejectUser", auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection(); // FIXED
@@ -1642,7 +1606,7 @@ app.post("/rejectUser", async (req, res) => {
 
 
 // 17. Update user
-app.post("/updateUser", async (req, res) => {
+app.post("/updateUser", auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection(); // FIXED
@@ -1705,7 +1669,7 @@ app.post("/updateUser", async (req, res) => {
 
 
 // 18. Get all rejected users
-app.get("/rejectedUsers", async (req, res) => {
+app.get("/rejectedUsers", auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection(); // FIXED
@@ -1760,14 +1724,6 @@ app.get("/students/:userId", async (req, res) => {
 
 
 
-// ✅ Middleware ثاني للتحقق من صلاحيات الأدمن
-function isAdmin(req, res, next) {
-  if (req.user && req.user.role === "admin") {
-    return next();
-  }
-  return res.status(403).json({ message: "Access denied, admin only" });
-}
-
 // ✅ Helper: توحيد قراءة الـ JSON Body
 function parseJsonBody(req, res) {
   if (!req.body) return {};
@@ -1785,7 +1741,7 @@ function parseJsonBody(req, res) {
 }
 
 // 20. 🔐 Get all users (Admins only) - IMPROVED
-app.get("/users", auth, isAdmin, async (req, res) => {
+app.get("/users", auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection();
@@ -1835,8 +1791,53 @@ app.get("/users", auth, isAdmin, async (req, res) => {
   }
 });
 
+// 20.b Get single user (basic info) by USER_ID - protected by JWT
+app.get("/users/:userId", auth, async (req, res) => {
+  let connection;
+  try {
+    connection = await getConnection();
+
+    const { userId } = req.params;
+    const result = await connection.execute(
+      `
+        SELECT 
+          u.USER_ID,
+          u.FULL_NAME,
+          u.EMAIL,
+          u.ROLE,
+          s.STUDENT_UNIVERSITY_ID,
+          s.STUDY_YEAR
+        FROM USERS u
+        LEFT JOIN STUDENTS s ON u.USER_ID = s.USER_ID
+        WHERE u.USER_ID = :userId
+      `,
+      { userId },
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+    );
+
+    if (!result.rows || result.rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const row = result.rows[0];
+    const safeRow = {};
+    Object.keys(row).forEach((key) => {
+      safeRow[key] = row[key] ?? null;
+    });
+
+    return res.status(200).json(safeRow);
+  } catch (err) {
+    console.error("❌ Error fetching user by id:", err);
+    return res
+      .status(500)
+      .json({ message: "❌ Error fetching user by id", error: err.message });
+  } finally {
+    if (connection) await connection.close();
+  }
+});
+
 // 21. 🔐 Add new user (Admins only) - IMPROVED
-app.post("/users", auth, isAdmin, async (req, res) => {
+app.post("/users", auth, async (req, res) => {
   const parsedBody = parseJsonBody(req, res);
   if (parsedBody === null) return; // تم الرد بخطأ JSON
 
@@ -1978,9 +1979,9 @@ app.post("/users", auth, isAdmin, async (req, res) => {
 
 // 22. User CRUD operations - IMPROVED
 app
-  .route("/users/:id")
+.route("/users/:id")
   // GET single user
-  .get(auth, isAdmin, async (req, res) => {
+  .get(auth, async (req, res) => {
     const { id } = req.params;
     let connection;
     try {
@@ -2022,7 +2023,7 @@ app
   })
 
   // UPDATE user
-  .put(auth, isAdmin, async (req, res) => {
+  .put(auth, async (req, res) => {
     const { id } = req.params;
 
     const parsedBody = parseJsonBody(req, res);
@@ -2225,7 +2226,7 @@ app
   })
 
   // DELETE user
-  .delete(auth, isAdmin, async (req, res) => {
+  .delete(auth, async (req, res) => {
     const { id } = req.params;
     let connection;
     try {
@@ -2558,7 +2559,7 @@ app.get("/doctors/:id/type", async (req, res) => {
 });
 
 // 28. Update doctor type
-app.put("/doctors/:id/type", async (req, res) => {
+app.put("/doctors/:id/type", auth, async (req, res) => {
   const { id } = req.params;
   const { doctorType } = req.body;
 
@@ -2596,7 +2597,7 @@ app.put("/doctors/:id/type", async (req, res) => {
 });
 
 // 29. Update doctor features
-app.put("/doctors/:id/features", async (req, res) => {
+app.put("/doctors/:id/features", auth, async (req, res) => {
   const { id } = req.params;
   const { allowedFeatures } = req.body;
 
@@ -2644,7 +2645,7 @@ app.put("/doctors/:id/features", async (req, res) => {
 
 
 // 30. Update multiple doctors features
-app.put("/doctors/batch/features", async (req, res) => {
+app.put("/doctors/batch/features", auth, async (req, res) => {
   const { doctorIds, allowedFeatures } = req.body;
 
   if (!Array.isArray(doctorIds) || !Array.isArray(allowedFeatures)) {
@@ -2711,7 +2712,7 @@ app.put("/doctors/batch/features", async (req, res) => {
 
 
 // 31. Simple batch update
-app.put("/doctors/batch/features-simple", async (req, res) => {
+app.put("/doctors/batch/features-simple", auth, async (req, res) => {
   const { doctorIds, allowedFeatures } = req.body;
 
   if (!Array.isArray(doctorIds) || !Array.isArray(allowedFeatures)) {
@@ -2752,7 +2753,7 @@ app.put("/doctors/batch/features-simple", async (req, res) => {
 
 
 // 32. Check if ID exists in pending users
-app.post("/pendingUsers/check-id", async (req, res) => {
+app.post("/pendingUsers/check-id", auth, isAdmin, async (req, res) => {
   const { idNumber } = req.body;
 
   if (!idNumber) {
@@ -2874,7 +2875,7 @@ app.get("/appointments/count", async (req, res) => {
 
 
 // 35. Get booking settings
-app.get("/bookingSettings", async (req, res) => {
+app.get("/bookingSettings", auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection();
@@ -3221,7 +3222,7 @@ app.get("/patients/:id", async (req, res) => {
 
 
 // 43. Update booking settings
-app.put("/bookingSettings", async (req, res) => {
+app.put("/bookingSettings", auth, async (req, res) => {
   const { fourthYearLimit, fifthYearLimit } = req.body;
 
   if (fourthYearLimit === undefined || fifthYearLimit === undefined) {
@@ -3250,7 +3251,7 @@ app.put("/bookingSettings", async (req, res) => {
 });
 
 // 44.NEW ENDPOINT: Add doctor to DOCTORS table
-app.post("/doctors", async (req, res) => {
+app.post("/doctors", auth, async (req, res) => {
   let { DOCTOR_ID, ALLOWED_FEATURES, DOCTOR_TYPE, IS_ACTIVE } = req.body;
 
   DOCTOR_ID = parseInt(DOCTOR_ID, 10);
@@ -3835,15 +3836,26 @@ app.get("/examination-full/:examId", auth, async (req, res) => {
   }
 });
 
-// 51. Get all pending x-ray requests
+// 51. Get all x-ray requests (optional filters)
+// Supports:
+// - status: filter by status (default: pending)
+// - doctorId: filter by doctor_uid/doctor_id
 app.get("/xray_requests", async (req, res) => {
   let connection;
+  const { status = "pending", doctorId, limit } = req.query;
+
+  const limitNum = Math.max(
+    1,
+    Math.min(parseInt(limit, 10) || 200, 500) // cap to avoid heavy queries
+  );
 
   try {
     connection = await getConnection();
 
     const sql = `
-      SELECT 
+      SELECT *
+      FROM (
+        SELECT 
         REQUEST_ID as request_id,
         PATIENT_ID as patient_id,
         PATIENT_NAME as patient_name,
@@ -3869,14 +3881,24 @@ app.get("/xray_requests", async (req, res) => {
         DOCTOR_NAME as doctor_name,
         CLINIC as clinic,
         DOCTOR_UID as doctor_uid,
+        DOCTOR_UID as doctor_id,
         TO_CHAR(CREATED_AT, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
         IMAGE as image
       FROM XRAY_REQUESTS
-      WHERE STATUS = 'pending'
+      WHERE (:status IS NULL OR STATUS = :status)
+        AND (:doctorId IS NULL OR DOCTOR_UID = :doctorId)
       ORDER BY CREATED_AT DESC
+      )
+      WHERE ROWNUM <= :limitNum
     `;
 
-    const result = await connection.execute(sql, {}, {
+    const binds = {
+      status: status ? status.toString() : null,
+      doctorId: doctorId ? doctorId.toString() : null,
+      limitNum
+    };
+
+    const result = await connection.execute(sql, binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT
     });
 
@@ -3909,10 +3931,10 @@ app.get("/xray_requests", async (req, res) => {
   }
 });
 
-// 52. Update x-ray request status
-app.put("/xray_requests/:requestId/status", async (req, res) => {
+// 52. Update x-ray request status (with image handoff to XRAY_IMAGES)
+app.put("/xray_requests/:requestId/status", auth, async (req, res) => {
   const { requestId } = req.params;
-  const { status, completedAt, completedBy } = req.body;
+  const { status, completedAt, completedBy, imageUrl, capturedAt } = req.body;
 
   if (!status) {
     return res.status(400).json({ message: "❌ Status is required" });
@@ -3922,34 +3944,114 @@ app.put("/xray_requests/:requestId/status", async (req, res) => {
   try {
     connection = await getConnection();
 
-    let sql;
-    let binds;
+    // جلب بيانات الطلب لاستخدامها عند إنشاء سجل الصورة
+    const reqResult = await connection.execute(
+      `SELECT REQUEST_ID, PATIENT_ID, PATIENT_NAME, STUDENT_ID, STUDENT_NAME, STUDENT_YEAR, XRAY_TYPE, IMAGE, CLINIC
+         FROM XRAY_REQUESTS
+        WHERE REQUEST_ID = :requestId`,
+      { requestId },
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+    );
 
-    if (status === "completed") {
-      sql = `
-        UPDATE XRAY_REQUESTS
-        SET 
-          STATUS = :status,
-          COMPLETED_AT = TO_TIMESTAMP(:completedAt, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'),
-          COMPLETED_BY = :completedBy
-        WHERE REQUEST_ID = :requestId
-      `;
-
-      binds = {
-        status,
-        completedAt: completedAt || new Date().toISOString(),
-        completedBy: completedBy || "فني الأشعة",
-        requestId
-      };
-    } else {
-      sql = `UPDATE XRAY_REQUESTS SET STATUS = :status WHERE REQUEST_ID = :requestId`;
-      binds = { status, requestId };
+    const requestRow = reqResult.rows?.[0];
+    if (!requestRow) {
+      return res.status(404).json({ message: "❌ X-ray request not found" });
     }
 
-    const result = await connection.execute(sql, binds, { autoCommit: true });
+    // محاولة جلب سنة دراسة الطالب من جدول USERS إذا لم تكن موجودة في الطلب
+    let studentYearFromUsers = null;
+    if (requestRow.STUDENT_ID) {
+      try {
+        const userRow = await connection.execute(
+          `SELECT STUDY_YEAR FROM STUDENTS WHERE USER_ID = :id`,
+          { id: requestRow.STUDENT_ID },
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+        studentYearFromUsers = userRow.rows?.[0]?.STUDY_YEAR ?? null;
+      } catch (e) {
+        console.warn("⚠️ Could not fetch STUDY_YEAR from USERS:", e.message);
+      }
+    }
 
-    if (result.rowsAffected === 0) {
-      return res.status(404).json({ message: "❌ X-ray request not found" });
+    const studyYearToUse = requestRow.STUDENT_YEAR ?? studentYearFromUsers ?? null;
+    const clinicToUse = requestRow.CLINIC ?? null;
+
+    const nowIso = new Date().toISOString();
+    const completedAtIso = completedAt || nowIso;
+    const capturedAtIso = capturedAt || nowIso;
+    const imageUrlToUse = imageUrl || requestRow.IMAGE;
+
+    if (status === "completed") {
+      if (imageUrlToUse) {
+        // إدراج سجل جديد في XRAY_IMAGES مع وقت التصوير والسنة الدراسية والعيادة
+        await connection.execute(
+          `
+          INSERT INTO XRAY_IMAGES (
+            IMAGE_ID, REQUEST_ID, PATIENT_ID, PATIENT_NAME,
+            STUDENT_ID, STUDENT_NAME, XRAY_TYPE, IMAGE_URL,
+            UPLOADED_AT, UPLOADED_BY, STATUS, CAPTURED_AT, STUDY_YEAR, CLINIC
+          ) VALUES (
+            :imageId, :requestId, :patientId, :patientName,
+            :studentId, :studentName, :xrayType, :imageUrl,
+            TO_TIMESTAMP(:uploadedAt, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'),
+            :uploadedBy, :status,
+            TO_TIMESTAMP(:capturedAt, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'),
+            :studyYear, :clinic
+          )
+          `,
+          {
+            imageId: uuidv4(),
+            requestId,
+            patientId: requestRow.PATIENT_ID,
+            patientName: requestRow.PATIENT_NAME,
+            studentId: requestRow.STUDENT_ID,
+            studentName: requestRow.STUDENT_NAME,
+            xrayType: requestRow.XRAY_TYPE,
+            imageUrl: imageUrlToUse,
+            uploadedAt: nowIso,
+            uploadedBy: completedBy || "فني الأشعة",
+            status,
+            capturedAt: capturedAtIso,
+            studyYear: studyYearToUse,
+            clinic: clinicToUse
+          }
+        );
+      }
+
+      // تحديث الطلب: حالة مكتملة + إضافة وقت الإكمال + تفريغ الصورة من الطلب
+      const result = await connection.execute(
+        `
+        UPDATE XRAY_REQUESTS
+           SET STATUS = :status,
+               COMPLETED_AT = TO_TIMESTAMP(:completedAt, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'),
+               COMPLETED_BY = :completedBy,
+               IMAGE = NULL
+         WHERE REQUEST_ID = :requestId
+        `,
+        {
+          status,
+          completedAt: completedAtIso,
+          completedBy: completedBy || "فني الأشعة",
+          requestId
+        }
+      );
+
+      if (result.rowsAffected === 0) {
+        await connection.rollback();
+        return res.status(404).json({ message: "❌ X-ray request not found" });
+      }
+
+      await connection.commit();
+    } else {
+      const result = await connection.execute(
+        `UPDATE XRAY_REQUESTS SET STATUS = :status WHERE REQUEST_ID = :requestId`,
+        { status, requestId },
+        { autoCommit: true }
+      );
+
+      if (result.rowsAffected === 0) {
+        return res.status(404).json({ message: "❌ X-ray request not found" });
+      }
     }
 
     res.status(200).json({
@@ -3959,6 +4061,7 @@ app.put("/xray_requests/:requestId/status", async (req, res) => {
     });
 
   } catch (err) {
+    if (connection) await connection.rollback();
     console.error("❌ Error updating xray request status:", err);
     res.status(500).json({
       message: "❌ Error updating xray request status",
@@ -4158,7 +4261,8 @@ app.post("/xray_images", async (req, res) => {
     patient_name,
     xray_type,
     image_url,      // from Object Storage
-    student_id
+    student_id,
+    captured_at     // optional, ISO; fallback now
   } = req.body;
 
   if (!request_id || !image_url || !xray_type) {
@@ -4176,7 +4280,7 @@ app.post("/xray_images", async (req, res) => {
     let fallback = {};
     try {
       const reqRow = await connection.execute(
-        `SELECT PATIENT_ID, PATIENT_NAME, STUDENT_ID, STUDENT_NAME, XRAY_TYPE 
+        `SELECT PATIENT_ID, PATIENT_NAME, STUDENT_ID, STUDENT_NAME, XRAY_TYPE, STUDENT_YEAR, CLINIC
          FROM XRAY_REQUESTS WHERE REQUEST_ID = :id`,
         { id: request_id },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
@@ -4186,26 +4290,29 @@ app.post("/xray_images", async (req, res) => {
       console.warn("⚠️ Could not fetch XRAY_REQUESTS for fallback:", e.message);
     }
 
-    // Get student name if student_id exists
+    // Get student name/year if student_id exists
     let student_name = null;
+    let student_year = null;
     if (student_id) {
       const st = await connection.execute(
-        `SELECT FULL_NAME FROM USERS WHERE USER_ID = :id`,
+        `SELECT FULL_NAME, STUDY_YEAR FROM STUDENTS WHERE USER_ID = :id`,
         { id: student_id },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
       student_name = st.rows[0]?.FULL_NAME || null;
+      student_year = st.rows[0]?.STUDY_YEAR ?? null;
     }
 
     const sql = `
       INSERT INTO XRAY_IMAGES (
         IMAGE_ID, REQUEST_ID, PATIENT_ID, PATIENT_NAME,
         STUDENT_ID, STUDENT_NAME, XRAY_TYPE,
-        IMAGE_URL, UPLOADED_AT
+        IMAGE_URL, UPLOADED_AT, STUDY_YEAR, CLINIC, CAPTURED_AT
       ) VALUES (
         :img_id, :req, :pid, :pname,
         :sid, :sname, :type,
-        :url, SYSTIMESTAMP
+        :url, SYSTIMESTAMP, :study_year, :clinic,
+        TO_TIMESTAMP(:captured_at, 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')
       )
     `;
 
@@ -4217,7 +4324,10 @@ app.post("/xray_images", async (req, res) => {
       sid: student_id || fallback.STUDENT_ID || null,
       sname: student_name || fallback.STUDENT_NAME || null,
       type: xray_type || fallback.XRAY_TYPE,
-      url: image_url
+      url: image_url,
+      study_year: student_year ?? fallback.STUDENT_YEAR ?? null,
+      clinic: fallback.CLINIC || null,
+      captured_at: captured_at || new Date().toISOString()
     };
 
     await connection.execute(sql, bind, { autoCommit: false });
@@ -4320,6 +4430,48 @@ app.get("/xray-images/request/:requestId", async (req, res) => {
   } catch (err) {
     console.error("❌ Error:", err);
     res.status(500).json([]);
+  } finally {
+    if (connection) await connection.close();
+  }
+});
+
+// 63. X-ray images report (grouped by type, clinic, year)
+app.get("/xray-images/report", async (req, res) => {
+  const { startDate, endDate } = req.query;
+
+  if (!startDate || !endDate) {
+    return res.status(400).json({ message: "startDate and endDate are required (YYYY-MM-DD)" });
+  }
+
+  let connection;
+  try {
+    connection = await getConnection();
+
+    const sql = `
+      SELECT 
+        XRAY_TYPE,
+        CLINIC,
+        SUM(CASE WHEN STUDY_YEAR = 4 THEN 1 ELSE 0 END) AS YEAR4_COUNT,
+        SUM(CASE WHEN STUDY_YEAR = 5 THEN 1 ELSE 0 END) AS YEAR5_COUNT
+      FROM XRAY_IMAGES
+      WHERE TRUNC(UPLOADED_AT) BETWEEN TO_DATE(:startDate, 'YYYY-MM-DD') AND TO_DATE(:endDate, 'YYYY-MM-DD')
+      GROUP BY XRAY_TYPE, CLINIC
+      ORDER BY XRAY_TYPE, CLINIC
+    `;
+
+    const result = await connection.execute(
+      sql,
+      { startDate, endDate },
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+    );
+
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching xray images report:", err);
+    res.status(500).json({
+      message: "❌ Error fetching xray images report",
+      error: err.message
+    });
   } finally {
     if (connection) await connection.close();
   }
@@ -4445,6 +4597,7 @@ app.post("/xray_requests", async (req, res) => {
     doctorName,
     clinic,
     doctorUid,
+    doctorId,
     image
   } = req.body;
 
@@ -4493,7 +4646,7 @@ app.post("/xray_requests", async (req, res) => {
       bitewing_teeth: bitewingTeeth ? JSON.stringify(bitewingTeeth) : null,
       doctor_name: doctorName || null,
       clinic: clinic || null,
-      doctor_uid: doctorUid || null,
+      doctor_uid: doctorUid || doctorId || null,
       image: image || null
     };
 
@@ -4507,6 +4660,98 @@ app.post("/xray_requests", async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ error: "فشل إرسال الطلب", details: error.message });
+  } finally {
+    if (connection) await connection.close();
+  }
+});
+
+// 66b. Update an existing xray request (details)
+app.put("/xray_requests/:requestId", async (req, res) => {
+  const { requestId } = req.params;
+  const {
+    patientId,
+    patientName,
+    studentId,
+    studentName,
+    studentFullName,
+    studentYear,
+    xrayType,
+    jaw,
+    occlusalJaw,
+    cbctJaw,
+    side,
+    tooth,
+    groupTeeth,
+    periapicalTeeth,
+    bitewingTeeth,
+    doctorName,
+    clinic,
+    doctorUid,
+    doctorId,
+    status
+  } = req.body;
+
+  let connection;
+  try {
+    connection = await getConnection();
+
+    const updateQuery = `
+      UPDATE XRAY_REQUESTS SET
+        PATIENT_ID = :patient_id,
+        PATIENT_NAME = :patient_name,
+        STUDENT_ID = :student_id,
+        STUDENT_NAME = :student_name,
+        STUDENT_FULL_NAME = :student_full_name,
+        STUDENT_YEAR = :student_year,
+        XRAY_TYPE = :xray_type,
+        JAW = :jaw,
+        OCCLUSAL_JAW = :occlusal_jaw,
+        CBCT_JAW = :cbct_jaw,
+        SIDE = :side,
+        TOOTH = :tooth,
+        GROUP_TEETH = :group_teeth,
+        PERIAPICAL_TEETH = :periapical_teeth,
+        BITEWING_TEETH = :bitewing_teeth,
+        DOCTOR_NAME = :doctor_name,
+        CLINIC = :clinic,
+        DOCTOR_UID = :doctor_uid,
+        STATUS = :status
+      WHERE REQUEST_ID = :request_id
+    `;
+
+    const binds = {
+      request_id: requestId,
+      patient_id: patientId,
+      patient_name: patientName,
+      student_id: studentId || null,
+      student_name: studentName || null,
+      student_full_name: studentFullName || studentName || null,
+      student_year: studentYear || null,
+      xray_type: xrayType,
+      jaw: jaw || null,
+      occlusal_jaw: occlusalJaw || null,
+      cbct_jaw: cbctJaw || null,
+      side: side || null,
+      tooth: tooth || null,
+      group_teeth: groupTeeth ? JSON.stringify(groupTeeth) : null,
+      periapical_teeth: periapicalTeeth ? JSON.stringify(periapicalTeeth) : null,
+      bitewing_teeth: bitewingTeeth ? JSON.stringify(bitewingTeeth) : null,
+      doctor_name: doctorName || null,
+      clinic: clinic || null,
+      doctor_uid: doctorUid || doctorId || null,
+      status: status || "pending"
+    };
+
+    const result = await connection.execute(updateQuery, binds, { autoCommit: true });
+
+    if (result.rowsAffected === 0) {
+      return res.status(404).json({ message: "❌ X-ray request not found" });
+    }
+
+    res.status(200).json({ message: "✅ X-ray request updated successfully", requestId });
+  } catch (error) {
+    console.error("❌ Error updating xray request:", error);
+    res.status(500).json({ error: "❌ Error updating xray request", details: error.message });
   } finally {
     if (connection) await connection.close();
   }
@@ -5192,7 +5437,7 @@ app.get("/patient_assignments", async (req, res) => {
 
 
 // 78. Assign patient to student (clean version)
-app.post('/assign_patient_to_student', async (req, res) => {
+app.post('/assign_patient_to_student', auth, async (req, res) => {
   const { patient_id, student_id } = req.body;
   if (!patient_id || !student_id) {
     return res.status(400).json({ error: 'patient_id و student_id مطلوبان' });
@@ -5261,7 +5506,7 @@ app.post('/assign_patient_to_student', async (req, res) => {
 
 
 // 79. Delete patient assignment
-app.delete('/remove_patient_assignment/:patientId', async (req, res) => {
+app.delete('/remove_patient_assignment/:patientId', auth, async (req, res) => {
   const { patientId } = req.params;
 
   let connection;
@@ -5294,7 +5539,7 @@ app.delete('/remove_patient_assignment/:patientId', async (req, res) => {
 
 
 // 80. Clear all assignments
-app.delete('/clear_all_assignments', async (req, res) => {
+app.delete('/clear_all_assignments', auth, async (req, res) => {
   let connection;
   try {
     connection = await getConnection();
@@ -5349,7 +5594,7 @@ app.get('/patient_assignments/:patientId', async (req, res) => {
 });
 
 // 82. Delete specific assignment
-app.delete('/remove_specific_assignment/:patientId/:studentId', async (req, res) => {
+app.delete('/remove_specific_assignment/:patientId/:studentId', auth, async (req, res) => {
   const { patientId, studentId } = req.params;
 
   let connection;
