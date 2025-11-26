@@ -1,3 +1,0 @@
-WALLET_LOCATION = (SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY="/Users/macbook/Documents/oracel-servr/oracle-api/wallet")))
-SSL_SERVER_DN_MATCH = yes
-SSL_CLIENT_AUTHENTICATION = true
