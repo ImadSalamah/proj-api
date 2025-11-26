@@ -27,12 +27,11 @@ const oracleClientLib = process.env.ORACLE_CLIENT_LIB;
 if (!oracleClientLib) {
   console.warn("⚠️ ORACLE_CLIENT_LIB not set; using system default client");
 } else {
-  try {
-    oracledb.initOracleClient({ libDir: oracleClientLib });
-  } catch (err) {
-    console.error("❌ Failed to initialize Oracle client. Set ORACLE_CLIENT_LIB to a valid path.", err);
+ // Render + Linux servers don't need Instant Client
+console.log("ℹ️ Using built-in OracleDB client (no Instant Client needed).");
+
   }
-}
+
 
 // ================================
 //  Oracle Connection Pool (Fixed)
