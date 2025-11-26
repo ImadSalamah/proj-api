@@ -3842,12 +3842,33 @@ app.get("/examination-full/:examId", auth, async (req, res) => {
 // - doctorId: filter by doctor_uid/doctor_id
 app.get("/xray_requests", async (req, res) => {
   let connection;
-  const { status = "pending", doctorId, limit } = req.query;
+  const { status, doctorId, limit } = req.query;
 
   const limitNum = Math.max(
     1,
-    Math.min(parseInt(limit, 10) || 200, 500) // cap to avoid heavy queries
+    Math.min(parseInt(limit, 10) || 200, 500)
   );
+
+  const normalizedStatus = status?.toString().toLowerCase();
+  const applyStatusFilter = normalizedStatus !== "all";
+  let statusValues;
+  if (!status && applyStatusFilter) {
+    statusValues = ["pending", "awaiting_dean_approval"];
+  } else if (!applyStatusFilter) {
+    statusValues = [];
+  } else {
+    statusValues = status
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  const statusClause =
+    statusValues.length > 0
+      ? `AND STATUS IN (${statusValues
+          .map((_, index) => `:status_${index}`)
+          .join(", ")})`
+      : "";
 
   try {
     connection = await getConnection();
@@ -3885,7 +3906,8 @@ app.get("/xray_requests", async (req, res) => {
         TO_CHAR(CREATED_AT, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
         IMAGE as image
       FROM XRAY_REQUESTS
-      WHERE (:status IS NULL OR STATUS = :status)
+      WHERE (1=1)
+        ${statusClause}
         AND (:doctorId IS NULL OR DOCTOR_UID = :doctorId)
       ORDER BY CREATED_AT DESC
       )
@@ -3893,10 +3915,13 @@ app.get("/xray_requests", async (req, res) => {
     `;
 
     const binds = {
-      status: status ? status.toString() : null,
       doctorId: doctorId ? doctorId.toString() : null,
       limitNum
     };
+
+    statusValues.forEach((value, index) => {
+      binds[`status_${index}`] = value;
+    });
 
     const result = await connection.execute(sql, binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT
@@ -4598,7 +4623,9 @@ app.post("/xray_requests", async (req, res) => {
     clinic,
     doctorUid,
     doctorId,
-    image
+    image,
+    requiresDeanApproval,
+    status
   } = req.body;
 
   if (!patientId || !patientName || !xrayType) {
@@ -4623,9 +4650,12 @@ app.post("/xray_requests", async (req, res) => {
         :request_id, :patient_id, :patient_name, :student_id, :student_name,
         :student_full_name, :student_year, :xray_type, :jaw, :occlusal_jaw,
         :cbct_jaw, :side, :tooth, :group_teeth, :periapical_teeth, :bitewing_teeth,
-        :doctor_name, :clinic, :doctor_uid, SYSTIMESTAMP, 'pending', SYSTIMESTAMP, :image
+        :doctor_name, :clinic, :doctor_uid, SYSTIMESTAMP, :status, SYSTIMESTAMP, :image
       )
     `;
+
+    const normalizedStatus =
+      status || (requiresDeanApproval ? "awaiting_dean_approval" : "pending");
 
     const values = {
       request_id: requestId,
@@ -4647,6 +4677,7 @@ app.post("/xray_requests", async (req, res) => {
       doctor_name: doctorName || null,
       clinic: clinic || null,
       doctor_uid: doctorUid || doctorId || null,
+      status: normalizedStatus,
       image: image || null
     };
 
@@ -6323,7 +6354,6 @@ app.put("/patients/:patientId", async (req, res) => {
 async function startServer() {
   try {
     await initOraclePool();
-    await ensureXrayImagesTable();
 
     app.listen(PORT, () => {
       console.log(`🚀 Dynamic API Server running on http://localhost:${PORT}`);
